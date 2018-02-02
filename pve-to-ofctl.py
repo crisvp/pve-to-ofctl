@@ -9,6 +9,7 @@ import os
 import sys
 import re
 import io
+import time
 import logging
 import subprocess
 import pyinotify
@@ -17,26 +18,34 @@ import pyinotify
 BRIDGE = 'vmbr0'
 ROUTER_MAC = '1E:C1:83:00:D3:49'
 LOGLEVEL = logging.DEBUG
+DELAY = 20 # Sleep for this amount of seconds when a change is detected
 
 # You probably don't need to fiddle with this.
-PVE = '/etc/pve/qemu-server'
+PVE_CONF = '/etc/pve/qemu-server'
+PVE_RUN = '/var/run/qemu-server'
 OFCTL_LIST = '/usr/bin/ovs-ofctl dump-ports-desc'
 OFCTL_SET = ['/usr/bin/ovs-ofctl', '--bundle', 'replace-flows']
 
+#table=0,priority=101 in_port={ofport} dl_src={mac} actions=normal
+#table=0,priority=100 in_port={ofport} actions=drop
+
 FLOWS = """
 ## Begin VMID {vmid} net{interface}
-priority=101 in_port={ofport} dl_src={mac} actions=normal
-priority=100 in_port={ofport} actions=drop
-priority=10  dl_src={mac} dl_dst={router} actions=normal
-priority=10  dl_dst={mac} dl_src={router} actions=normal
-priority=0   actions=drop
+table=0,priority=100 in_port={router_ofport} dl_src={router_mac} dl_dst={mac} actions=normal
+table=0,priority=100 in_port={router_ofport} dl_src={router_mac} dl_dst=00:01:00:00:00:00/00:01:00:00:00:00 actions=normal
+table=0,priority=100 in_port={router_ofport} dl_src={router_mac} dl_dst=33:33:00:00:00:00/33:33:00:00:00:00 actions=normal
+table=0,priority=50 in_port={ofport} dl_src={mac} dl_dst={router_mac} actions=normal
+table=0,priority=50 in_port={ofport} dl_src={mac} dl_dst=ff:ff:ff:ff:ff:ff actions=output:{router_ofport}
+table=0,priority=50 in_port={ofport} dl_src={mac} dl_dst=01:00:00:00:00:00/01:00:00:00:00:00 actions=output:{router_ofport}
+table=0,priority=50 in_port={ofport} dl_src={mac} dl_dst=33:33:00:00:00:00/33:33:00:00:00:00 actions=output:{router_ofport}
+table=0,priority=0 actions=drop
 """
 
 logger = logging.getLogger(__name__)
 
 
-def generate_flows(interface):
-    interface.update({'router': ROUTER_MAC.lower()})
+def generate_flows(interface, router):
+    interface.update({'router_{}'.format(k): v for k, v in router.items()})
     try:
         flows = FLOWS.format(**interface)
     except KeyError:
@@ -48,16 +57,21 @@ def generate_flows(interface):
 def all_flows(path):
     config = os.listdir(path)
     interfaces = {}
+    snoozed = False
 
     for c in config:
         m = re.match('(.*)\.conf$', c)
         if not m:
             continue
 
+        if not snoozed:
+            time.sleep(DELAY)
+            snoozed = True
+
         vmid = m.group(1)
         interfaces[vmid] = {'vmid': vmid}
 
-        with open(os.path.join(PVE, c), 'r') as f:
+        with open(os.path.join(path, c), 'r') as f:
             for line in f.readlines():
                 m = re.match('^net([0-9]+): virtio=([0-9A-F:]+).*bridge={}'.format(BRIDGE), line)
                 if m:
@@ -76,13 +90,16 @@ def all_flows(path):
             interface = m.group(3)
             bridge_mac = m.group(4)
 
+            if vmid not in interfaces:
+                interfaces[vmid] = {}
+
             interfaces[vmid]['interface'] = interface
             interfaces[vmid]['ofport'] = ofport
             logger.debug('Found interface: %s', interfaces[vmid])
 
     flows = []
     for k, v in interfaces.items():
-        f = generate_flows(v)
+        f = generate_flows(v, find_by_mac(interfaces, ROUTER_MAC))
         if f:
             flows.append(f)
 
@@ -105,6 +122,14 @@ def configure_flows(flows):
     return rc
 
 
+def find_by_mac(interfaces, mac):
+    for k, v in interfaces.items():
+        if 'mac' in v and v['mac'].lower() == mac.lower():
+            return v
+
+    return None
+
+
 class NotifyHandler(pyinotify.ProcessEvent):
     def process_IN_CLOSE_WRITE(self, event):
         self.process(event)
@@ -113,7 +138,7 @@ class NotifyHandler(pyinotify.ProcessEvent):
         self.process(event)
 
     def process(self, event):
-        if not re.match('^[0-9]+\.conf$', event.name):
+        if not re.match('^[0-9]+\.(conf|pid)$', event.name):
             return
 
         flows = all_flows(event.path)
@@ -129,10 +154,11 @@ if __name__ == '__main__':
     logger.setLevel(LOGLEVEL)
     logger.addHandler(sh)
 
-    flows = all_flows(PVE)
+    flows = all_flows(PVE_CONF)
     configure_flows(flows)
 
     wm = pyinotify.WatchManager()
     notifier = pyinotify.Notifier(wm, NotifyHandler())
-    wm.add_watch(PVE, pyinotify.IN_CLOSE_WRITE | pyinotify.IN_DELETE, rec=True, auto_add=True)
+    wm.add_watch(PVE_CONF, pyinotify.IN_CLOSE_WRITE | pyinotify.IN_DELETE, rec=True, auto_add=True)
+    wm.add_watch(PVE_RUN, pyinotify.IN_CLOSE_WRITE | pyinotify.IN_DELETE, rec=True, auto_add=True)
     notifier.loop()
