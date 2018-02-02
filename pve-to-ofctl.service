@@ -1,0 +1,12 @@
+[Unit]
+Description=PVE to OpenFlow flow generator
+After=pve-cluster.service
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/pve-to-ofctl.py
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
