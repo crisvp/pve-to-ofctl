@@ -20,12 +20,12 @@ LOGLEVEL = logging.DEBUG
 
 # You probably don't need to fiddle with this.
 PVE = '/etc/pve/qemu-server'
-VSCTL_LIST = '/usr/bin/ovs-vsctl --columns=name,ofport list interface'
+OFCTL_LIST = '/usr/bin/ovs-ofctl dump-ports-desc'
 OFCTL_SET = ['/usr/bin/ovs-ofctl', '--bundle', 'replace-flows']
 
 FLOWS = """
 ## Begin VMID {vmid} net{interface}
-priority=101 in_port={ofport} dl_src={router} actions=normal
+priority=101 in_port={ofport} dl_src={mac} actions=normal
 priority=100 in_port={ofport} actions=drop
 priority=10  dl_src={mac} dl_dst={router} actions=normal
 priority=10  dl_dst={mac} dl_src={router} actions=normal
@@ -59,25 +59,26 @@ def all_flows(path):
 
         with open(os.path.join(PVE, c), 'r') as f:
             for line in f.readlines():
-                m = re.match('^net([0-9]+): virtio=([0-9A-F:]+)', line)
+                m = re.match('^net([0-9]+): virtio=([0-9A-F:]+).*bridge={}'.format(BRIDGE), line)
                 if m:
                     interfaces[vmid]['mac'] = m.group(2).lower()
                     interfaces[vmid]['netid'] = m.group(1)
 
-    vsctl = subprocess.check_output(VSCTL_LIST, shell=True).decode('utf-8')
+    vsctl = subprocess.check_output('{} {}'.format(OFCTL_LIST, BRIDGE), shell=True).decode('utf-8')
+    logger.debug('vsctl: %s', vsctl)
 
     lines = vsctl.split('\n')
     for i, line in enumerate(lines):
-        m = re.match('^name\s*:\s+"tap([a-zA-Z0-9]+)i([0-9]+)"$', lines[i])
+        m = re.match('^\s*([0-9]+)\(tap([0-9]+)i([0-9]+)\):\s+addr:([a-f0-9:]+)$', line)
         if m:
-            vmid = m.group(1)
-            interface = m.group(2)
-
-            m = re.match('^ofport\s*:\s+([0-9]+)$', lines[i + 1])
             ofport = m.group(1)
+            vmid = m.group(2)
+            interface = m.group(3)
+            bridge_mac = m.group(4)
 
             interfaces[vmid]['interface'] = interface
             interfaces[vmid]['ofport'] = ofport
+            logger.debug('Found interface: %s', interfaces[vmid])
 
     flows = []
     for k, v in interfaces.items():
